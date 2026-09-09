@@ -1,0 +1,33 @@
+# hondi-search-relay — 혼디 검색(/hondi-search) 전용 Worker.
+# hondi-proxy(Openhash-Gopang/hondi, worker.js)와 완전히 별개다.
+#
+# 배경(2026-09-09 세션): hondi-proxy에 hondi.net/hondi-search Route를
+# 얹었더니 사이트 전역이 Cloudflare Error 1042로 막히는 사고가 있었다
+# (docs/HANDOFF_SITEWIDE_1042_CORS_BLOCK_20260909_v1_0.md). 같은 날
+# test-route-probe 실험으로 "1042는 그 zone에 Route를 가진 바로 그
+# Worker에만 걸린다"는 게 실증 확정됐다 — 그래서 hondi-search 로직 전체를
+# hondi-proxy에서 분리해 이 전용 Worker로 옮긴다. hondi-proxy는 이 zone에
+# Route가 없는 원래 상태를 유지하므로, 나머지 50개 파일의
+# hondi-proxy.tensor-city.workers.dev 직접 호출은 전혀 영향받지 않는다.
+#
+# ⚠ 배포는 반드시 C:\Users\<사용자>\... 프로필 트리 바깥(예: C:\temp\...)
+#   에서 실행할 것 — 프로필 안에서 실행하면 wrangler가 Application Data
+#   junction에 걸려 매번 권한 에러로 실패한다(이 PC에서 실증 확인됨).
+
+name = "hondi-search-relay"
+main = "src/index.js"
+account_id = "8897e584cfc42457b462f76fdcf6e157"
+compatibility_date = "2026-07-12"
+
+[[routes]]
+pattern = "hondi.net/hondi-search"
+zone_name = "hondi.net"
+
+# hondi-proxy(메인 wrangler.toml)와 동일한 네임스페이스를 그대로 재사용한다.
+# KV 네임스페이스는 여러 Worker에 동시에 바인딩할 수 있으므로 새로 만들
+# 필요가 없다 — id는 hondi-proxy의 wrangler.toml에서 실사 확인된 값
+# (2026-09-09 PR #150, `wrangler kv namespace list`로 검증됨)을 그대로
+# 가져왔다.
+[[kv_namespaces]]
+binding = "HONDI_SEARCH_HISTORY"
+id = "1f4830905eb34e4abc65451b62d4e19b"
