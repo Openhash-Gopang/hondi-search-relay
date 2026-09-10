@@ -42,7 +42,14 @@ const HONDI_SEARCH_SP = `당신은 혼디(hondi.net)의 사이트 내 검색 도
    저장한 계약서 찾아줘")는 모호하지 않으므로 되묻지 않고 곧바로 규칙 4를
    적용합니다.
 2. 명확화 후에도 여전히 모호하면 최상위 후보 3개를 candidates로 제시합니다.
-3. 목적지가 명확해지면 navigate로 응답하며, 새 탭으로 이동할 URL을 반환합니다.
+3. 목적지가 명확해지면 navigate로 응답합니다. 이때 절대 URL을 스스로 조합하거나
+   추측하지 마십시오 — 반드시 매니페스트 항목의 "path" 값을 정확히 그대로
+   "manifest_path"에 담아 반환하십시오. 실제 이동할 URL(pc_url)은 이 워커가
+   매니페스트에서 직접 조회해 채웁니다. 당신은 URL 문자열 자체를 만들지 않습니다.
+3-1. 이 엔드포인트(/hondi-search)는 desktop.html 상단 검색 전용이며, 호출자는
+   항상 PC입니다. 그러므로 "manifest_path"는 매니페스트에 있는 값을 그대로
+   복사한 것이어야 하며, webapp.html처럼 모바일 전용 화면을 가리키는 값을
+   당신이 직접 지어내서는 안 됩니다 — 애초에 그런 값은 매니페스트에 없습니다.
 4. 당신은 사용자 데이터(메일함, 문서 등)에 접근하지 않습니다.
    데이터 자체를 찾는 요청은 K-Search 영역이므로,
    "OO을 찾으시는 건 K-Search가 담당합니다"라고 안내하고 K-Search로 위임합니다.
@@ -53,8 +60,8 @@ const HONDI_SEARCH_SP = `당신은 혼디(hondi.net)의 사이트 내 검색 도
 {
   "type": "clarify" | "navigate" | "candidates" | "delegate_ksearch",
   "message": "사용자에게 보여줄 한국어 문장",
-  "url": "type=navigate일 때만, 이동할 절대경로 URL",
-  "candidates": [{"label": "...", "url": "..."}]  // type=candidates일 때만
+  "manifest_path": "type=navigate일 때만, 매니페스트 항목의 path 값 그대로",
+  "candidates": [{"label": "...", "manifest_path": "..."}]  // type=candidates일 때만
 }
 
 [사이트 매니페스트]
@@ -77,26 +84,40 @@ const FALLBACK_MANIFEST = [
     title: 'K-Mail',
     description: '자연어 명령으로 메일을 보내고 받는 혼디 사용자 메일 기능',
     keywords: ['메일', '이메일', 'K-Mail', '발신', '수신', '메일 보내기'],
+    pc_url: 'https://mail.hondi.net',
   },
   {
     path: '/docs/kmail-intro',
     title: 'K-Mail 소개',
     description: 'K-Mail 시스템 자체의 개념과 사용법을 설명하는 문서',
     keywords: ['메일 시스템', 'K-Mail이란', '메일 기능 소개', '혼디 메일 시스템'],
+    pc_url: 'https://mail.hondi.net',
   },
   {
     path: '/services/klaw',
     title: 'K-Law',
     description: '법률 상담 및 판례 시뮬레이션 AI 서비스',
     keywords: ['법률', 'K-Law', '판례', '법률 상담', '소송'],
+    pc_url: 'https://klaw.hondi.net',
   },
   {
     path: '/services/kjob',
     title: 'K-Job',
     description: '구인·구직 및 업무 오케스트레이션 서비스',
     keywords: ['구직', '구인', '일자리', 'K-Job', '채용'],
+    pc_url: 'https://job.hondi.net',
   },
 ];
+
+// manifest_path(모델이 고른 매니페스트 항목의 path)를 실제 PC용 절대 URL로
+// 바꾼다. 모델이 URL 문자열 자체를 만들지 않게 하고, 이 워커가 매니페스트에
+// 있는 pc_url을 그대로 쓰게 강제하는 게 이 함수의 목적 — path가 매니페스트에
+// 없으면(모델의 환각) null을 반환하고, 호출부가 clarify로 안전하게 되돌린다.
+function resolveManifestUrl(manifestPath, manifest) {
+  if (!manifestPath) return null;
+  const entry = (manifest || []).find((m) => m.path === manifestPath);
+  return entry && entry.pc_url ? entry.pc_url : null;
+}
 
 async function fetchManifestFromOrigin(env) {
   const url = env.SITE_MANIFEST_URL || 'https://hondi.net/site-manifest.json' /* 리포 루트에 위치 - public/ 아님, GitHub Pages가 루트를 그대로 미러링하므로 */;
@@ -310,6 +331,27 @@ export async function handleHondiSearch(request, env, corsHeaders, { _err }) {
     });
     const rawText = deepseekData?.choices?.[0]?.message?.content ?? '{}';
     parsed = safeParseJson(rawText);
+
+    // 2026-09-10 수정 — 모델이 만든 url 문자열을 신뢰하지 않는다. navigate/
+    // candidates는 manifest_path만 받고, 실제 이동 URL은 여기서 매니페스트의
+    // pc_url을 직접 조회해 채운다. path가 매니페스트에 없으면(환각) PC 검색
+    // 전용 엔드포인트가 존재하지도 않는 곳으로, 혹은 webapp.html 같은 모바일
+    // 화면으로 사용자를 보내는 대신 안전하게 명확화 질문으로 되돌린다.
+    if (parsed.type === 'navigate') {
+      const resolvedUrl = resolveManifestUrl(parsed.manifest_path, manifest);
+      if (!resolvedUrl) {
+        parsed = {
+          type: 'clarify',
+          message: '정확히 어떤 페이지를 찾으시는지 다시 한번 말씀해주시겠어요?',
+        };
+      } else {
+        parsed.url = resolvedUrl;
+      }
+    } else if (parsed.type === 'candidates') {
+      parsed.candidates = (parsed.candidates || [])
+        .map((c) => ({ label: c.label, url: resolveManifestUrl(c.manifest_path, manifest) }))
+        .filter((c) => c.url);
+    }
   } catch (e) {
     console.error('[hondi-search] deepseek 호출 실패:', e);
     return new Response(
