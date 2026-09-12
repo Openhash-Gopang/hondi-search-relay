@@ -194,6 +194,15 @@ async function loadPersonaIndex(env) {
   return index;
 }
 
+// 2026-09-13 발견 — "비서"(professor-secretarial 페르소나 라벨)가 혼디 자체
+// 브랜딩 용어("AI 비서")와 글자 그대로 겹쳐, "혼디에 어떤 AI 비서 종류들이
+// 있는지 알려줘" 같은 일반 질의가 이 페르소나로 오탐되던 문제를 50개
+// 스모크테스트 중 실측으로 확인했다. 다른 짧은 라벨(내과·안과·금융·무역
+// 등 47개)은 혼디 자체 용어와 안 겹쳐 부분일치를 그대로 둬도 안전하므로,
+// 라벨 전체를 짧다고 일괄 배제하는 대신 실제 충돌이 확인된 라벨만
+// 개별적으로 여기 추가한다(발견될 때마다 갱신).
+const AMBIGUOUS_PERSONA_LABELS = new Set(['비서']);
+
 function matchPersonaByQuery(message, personaIndex) {
   const q = (message || '').trim();
   if (!q) return null;
@@ -207,7 +216,15 @@ function matchPersonaByQuery(message, personaIndex) {
       `${p.parentLabel} ${p.label}`,
     ].filter(Boolean);
 
-    const hit = candidates.some((c) => q.includes(c) || c.includes(q));
+    const hit = candidates.some((c) => {
+      // 충돌이 확인된 라벨(예: "비서")은 질의 전체와 정확히 같을 때만
+      // 매칭한다 — 부분일치를 허용하면 "AI 비서"처럼 혼디 자체 용어가
+      // 들어간 일반 질의까지 전부 삼켜버린다. 이 라벨을 조합한
+      // `${p.label} ${p.parentLabel}` 같은 문자열은 이미 충분히 길고
+      // 구체적이라 원래 방식(부분일치)을 그대로 둬도 안전하다.
+      if (AMBIGUOUS_PERSONA_LABELS.has(c)) return q === c;
+      return q.includes(c) || c.includes(q);
+    });
     if (hit) matches.push({ id: pid, ...p });
   }
 
