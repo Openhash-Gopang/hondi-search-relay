@@ -50,12 +50,20 @@ const HONDI_SEARCH_SP = `당신은 혼디(hondi.net)의 사이트 내 검색 도
    항상 PC입니다. 그러므로 "manifest_path"는 매니페스트에 있는 값을 그대로
    복사한 것이어야 하며, webapp.html처럼 모바일 전용 화면을 가리키는 값을
    당신이 직접 지어내서는 안 됩니다 — 애초에 그런 값은 매니페스트에 없습니다.
+3-2. 아래 매니페스트에는 사용자가 선택한 검색 범위(scope)에 해당하는
+   항목만 담겨 있습니다 — 이미 필터링이 끝난 상태입니다. 매니페스트에
+   없는 페이지는 그 범위에 존재하지 않는 것이므로, 없는 페이지를
+   있다고 지어내거나 다른 범위의 페이지를 억지로 끌어와 답하지 마십시오
+   (예: 매니페스트에 진짜 없는 페이지인데 이름이 비슷하다는 이유만으로
+   navigate하는 것 — 2026-09-13 "혼디 숫자 코드" 오매칭 사고가 이 유형).
+   그런 경우 정직하게 "이 범위에서는 해당 페이지를 찾지 못했습니다"라고
+   clarify로 답하십시오.
 4. 당신은 사용자 데이터(메일함, 문서 등)에 접근하지 않습니다.
    데이터 자체를 찾는 요청은 K-Search 영역이므로,
    "OO을 찾으시는 건 K-Search가 담당합니다"라고 안내하고 K-Search로 위임합니다.
 5. 응답은 반드시 아래 JSON 스키마만 출력합니다. 그 외 텍스트를 포함하지 않습니다.
    설명이나 마크다운 코드펜스 없이 순수 JSON 객체 하나만 출력하십시오.
-
+{{SCOPE_NOTE}}
 응답 스키마:
 {
   "type": "clarify" | "navigate" | "candidates" | "delegate_ksearch",
@@ -69,6 +77,22 @@ const HONDI_SEARCH_SP = `당신은 혼디(hondi.net)의 사이트 내 검색 도
 
 [대화 히스토리]
 {{CONVERSATION_HISTORY}}`;
+
+// scope='dev'일 때만 시스템 프롬프트에 덧붙는 보조 규칙. 개발자 문서
+// 매니페스트 항목엔 title에 날짜가 박혀 있고 date 필드로도 파싱돼 있으므로,
+// "최근 것"류 상대 시간 질의를 date 내림차순으로 해석하도록 안내한다.
+// scope='user'일 때는 빈 문자열로 치환돼 핵심 로직에 아무 영향이 없다.
+const DEV_SCOPE_NOTE = `
+6. (개발자 문서 범위 전용) "최근 것", "이번 주" 같은 상대적 시간 표현이
+   질의에 있으면, 매니페스트 각 항목의 "date" 필드(있는 경우) 기준
+   내림차순으로 우선순위를 매겨 답하십시오. date가 없는 항목은 오래된
+   참조 매뉴얼로 간주해 "최근" 질의의 후보에서 낮은 우선순위로 둡니다.
+`;
+
+const VALID_SCOPES = new Set(['user', 'dev']);
+function normalizeScope(scope) {
+  return VALID_SCOPES.has(scope) ? scope : 'user'; // 기본값 — Phase 0 결정: "전체" 옵션 없음, 미지정 시 사용자용
+}
 
 const HISTORY_TTL_SECONDS = 60 * 10; // 10분 미사용 시 세션 만료
 const MANIFEST_CACHE_TTL_SECONDS = 60 * 60; // 매니페스트 캐시 1시간
@@ -85,6 +109,7 @@ const FALLBACK_MANIFEST = [
     description: '자연어 명령으로 메일을 보내고 받는 혼디 사용자 메일 기능',
     keywords: ['메일', '이메일', 'K-Mail', '발신', '수신', '메일 보내기'],
     pc_url: 'https://mail.hondi.net',
+    audience: 'user',
   },
   {
     path: '/docs/kmail-intro',
@@ -92,6 +117,7 @@ const FALLBACK_MANIFEST = [
     description: 'K-Mail 시스템 자체의 개념과 사용법을 설명하는 문서',
     keywords: ['메일 시스템', 'K-Mail이란', '메일 기능 소개', '혼디 메일 시스템'],
     pc_url: 'https://mail.hondi.net',
+    audience: 'user',
   },
   {
     path: '/services/klaw',
@@ -99,6 +125,7 @@ const FALLBACK_MANIFEST = [
     description: '법률 상담 및 판례 시뮬레이션 AI 서비스',
     keywords: ['법률', 'K-Law', '판례', '법률 상담', '소송'],
     pc_url: 'https://klaw.hondi.net',
+    audience: 'user',
   },
   {
     path: '/services/kjob',
@@ -106,6 +133,7 @@ const FALLBACK_MANIFEST = [
     description: '구인·구직 및 업무 오케스트레이션 서비스',
     keywords: ['구직', '구인', '일자리', 'K-Job', '채용'],
     pc_url: 'https://job.hondi.net',
+    audience: 'user',
   },
 ];
 
@@ -206,6 +234,15 @@ async function loadManifest(env) {
   return manifest;
 }
 
+// 캐시/원본은 전체 매니페스트(모든 audience) 하나만 유지한다 — scope별로
+// 별도 캐시를 두면 그 자체가 또 다른 동기화 대상이 되므로(이 레포가
+// 반복해서 겪은 "사본 두 곳" 패턴), 필터링은 항상 요청 시점에 메모리에서
+// 수행한다. audience 필드가 없는 예전 형식 항목(수동 이관 중 누락 등)은
+// 안전하게 'user'로 간주해 사용자 검색에서 제외되지 않게 한다.
+function filterManifestByScope(manifest, scope) {
+  return (manifest || []).filter((m) => (m.audience || 'user') === scope);
+}
+
 async function loadHistory(env, conversationId) {
   if (!conversationId) return [];
   const raw = await env.HONDI_SEARCH_HISTORY.get(`conv:${conversationId}`, 'json');
@@ -238,8 +275,9 @@ function buildUserContentWithAttachment(message, attachment) {
   return `${message}${note}`;
 }
 
-function buildMessages(sp, manifest, history, message) {
+function buildMessages(sp, manifest, history, message, scope) {
   const systemPrompt = sp
+    .replace('{{SCOPE_NOTE}}', scope === 'dev' ? DEV_SCOPE_NOTE : '')
     .replace('{{SITE_MANIFEST_JSON}}', JSON.stringify(manifest))
     .replace('{{CONVERSATION_HISTORY}}', JSON.stringify(history));
 
@@ -271,10 +309,11 @@ export async function handleHondiSearch(request, env, corsHeaders, { _err }) {
   const body = await request.json().catch(() => null);
   if (!body) return _err(400, 'INVALID_JSON', 'JSON body 필수', corsHeaders);
 
-  const { conversation_id, message, attachment } = body;
+  const { conversation_id, message, attachment, scope: rawScope } = body;
   if (!message || typeof message !== 'string') {
     return _err(400, 'message_required', 'message 필드가 필요합니다', corsHeaders);
   }
+  const scope = normalizeScope(rawScope);
 
   // 전문가 페르소나 로컬 매칭 - 첨부파일이 없는 순수 텍스트 질의에만 적용.
   // 매칭되면 deepseek 호출 없이 바로 navigate (더 빠르고, id 추측으로 인한
@@ -317,9 +356,16 @@ export async function handleHondiSearch(request, env, corsHeaders, { _err }) {
     loadManifest(env),
     loadHistory(env, conversation_id),
   ]);
+  // scope 필터링은 항상 요청 시점에 메모리에서 수행 — 캐시는 전체
+  // 매니페스트 하나만 유지한다(위 filterManifestByScope 주석 참조).
+  // ※ UI(Phase 4)가 스코프 토글을 바꿀 때는 새 conversation_id를
+  //   발급해야 한다 — 같은 대화 히스토리 안에서 scope가 바뀌면 이전
+  //   turn이 다른 범위의 매니페스트를 전제로 한 대화라 모델이 혼동할
+  //   수 있다(이 워커는 그 경우를 별도로 방어하지 않는다).
+  const scopedManifest = filterManifestByScope(manifest, scope);
 
   const userContent = buildUserContentWithAttachment(message, attachment);
-  const messages = buildMessages(HONDI_SEARCH_SP, manifest, history, userContent);
+  const messages = buildMessages(HONDI_SEARCH_SP, scopedManifest, history, userContent, scope);
 
   let parsed;
   try {
@@ -338,7 +384,7 @@ export async function handleHondiSearch(request, env, corsHeaders, { _err }) {
     // 전용 엔드포인트가 존재하지도 않는 곳으로, 혹은 webapp.html 같은 모바일
     // 화면으로 사용자를 보내는 대신 안전하게 명확화 질문으로 되돌린다.
     if (parsed.type === 'navigate') {
-      const resolvedUrl = resolveManifestUrl(parsed.manifest_path, manifest);
+      const resolvedUrl = resolveManifestUrl(parsed.manifest_path, scopedManifest);
       if (!resolvedUrl) {
         parsed = {
           type: 'clarify',
@@ -349,7 +395,7 @@ export async function handleHondiSearch(request, env, corsHeaders, { _err }) {
       }
     } else if (parsed.type === 'candidates') {
       parsed.candidates = (parsed.candidates || [])
-        .map((c) => ({ label: c.label, url: resolveManifestUrl(c.manifest_path, manifest) }))
+        .map((c) => ({ label: c.label, url: resolveManifestUrl(c.manifest_path, scopedManifest) }))
         .filter((c) => c.url);
     }
   } catch (e) {
