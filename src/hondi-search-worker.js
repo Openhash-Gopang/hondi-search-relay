@@ -61,19 +61,34 @@ const HONDI_SEARCH_SP = `당신은 혼디(hondi.net)의 사이트 내 검색 도
 4. 당신은 사용자 데이터(메일함, 문서 등)에 접근하지 않습니다.
    데이터 자체를 찾는 요청은 K-Search 영역이므로,
    "OO을 찾으시는 건 K-Search가 담당합니다"라고 안내하고 K-Search로 위임합니다.
-5. 응답은 반드시 아래 JSON 스키마만 출력합니다. 그 외 텍스트를 포함하지 않습니다.
+5. (2026-09-14 신설) 사용자의 질의가 페이지 이동 의도가 아니라 "사실을 묻는
+   정보성 질문"(예: "혼디는 누가 만들었나요?", "PDV가 뭔가요?")이면, 아래
+   [HONDI-FAQ 참고자료] 섹션의 내용을 근거로 직접 답변하십시오. 이때
+   type: info_answer로 응답하고, message 필드에 참고자료 내용을 자연스러운
+   한국어 문장으로 녹여 답변을 작성합니다(참고자료 문장을 그대로 베끼지
+   말고 표현을 바꾸어 전달). [HONDI-FAQ 참고자료] 섹션이 비어 있거나
+   질문과 무관하면 info_answer를 절대 사용하지 마십시오 — 근거 없이 답을
+   지어내는 것은 매니페스트에 없는 페이지로 navigate하는 것과 똑같은
+   환각이며 금지됩니다. 그런 경우 대신 clarify나 candidates로 안전하게
+   답하거나, 페이지 이동 의도로 재해석해 기존 규칙(1~4)을 적용하십시오.
+6. 응답은 반드시 아래 JSON 스키마만 출력합니다. 그 외 텍스트를 포함하지 않습니다.
    설명이나 마크다운 코드펜스 없이 순수 JSON 객체 하나만 출력하십시오.
 {{SCOPE_NOTE}}
 응답 스키마:
 {
-  "type": "clarify" | "navigate" | "candidates" | "delegate_ksearch",
-  "message": "사용자에게 보여줄 한국어 문장",
+  "type": "clarify" | "navigate" | "candidates" | "delegate_ksearch" | "info_answer",
+  "message": "사용자에게 보여줄 한국어 문장(info_answer일 때는 답변 본문)",
   "manifest_path": "type=navigate일 때만, 매니페스트 항목의 path 값 그대로",
   "candidates": [{"label": "...", "manifest_path": "..."}]  // type=candidates일 때만
 }
 
 [사이트 매니페스트]
 {{SITE_MANIFEST_JSON}}
+
+[HONDI-FAQ 참고자료 — 이번 질문과 관련해 매칭된 배경 설명. 비어 있으면
+ 정보성 질문이 아니거나 매칭되는 자료가 없다는 뜻이므로 info_answer를
+ 쓰지 마십시오]
+{{FAQ_CONTEXT}}
 
 [대화 히스토리]
 {{CONVERSATION_HISTORY}}`;
@@ -83,7 +98,7 @@ const HONDI_SEARCH_SP = `당신은 혼디(hondi.net)의 사이트 내 검색 도
 // "최근 것"류 상대 시간 질의를 date 내림차순으로 해석하도록 안내한다.
 // scope='user'일 때는 빈 문자열로 치환돼 핵심 로직에 아무 영향이 없다.
 const DEV_SCOPE_NOTE = `
-6. (개발자 문서 범위 전용) "최근 것", "이번 주" 같은 상대적 시간 표현이
+7. (개발자 문서 범위 전용) "최근 것", "이번 주" 같은 상대적 시간 표현이
    질의에 있으면, 매니페스트 각 항목의 "date" 필드(있는 경우) 기준
    내림차순으로 우선순위를 매겨 답하십시오. date가 없는 항목은 오래된
    참조 매뉴얼로 간주해 "최근" 질의의 후보에서 낮은 우선순위로 둡니다.
@@ -154,6 +169,111 @@ async function fetchManifestFromOrigin(env) {
     throw new Error(`site-manifest fetch failed: ${res.status}`);
   }
   return res.json();
+}
+
+// 2026-09-14 신설 — "정보성 질문에 직접 답하기" 기능.
+// HONDI_FAQ_REGISTRY(hondi 레포 src/gopang/ai/hondi-faq-router.js)는 원래
+// 일반 AI 비서(AC/GWP) 전용이었다. 이 워커는 별도 저장소라 그 .js 파일을
+// import할 수 없으므로, site-manifest.json과 완전히 같은 패턴 — hondi 레포가
+// tools/generate_faq_manifest.py로 미리 생성해 루트에 커밋해 둔
+// hondi-faq-manifest.json을 fetch — 를 그대로 재사용한다. 즉 "정본"은
+// 여전히 hondi 레포의 .js 배열 하나뿐이고, 이 워커는 그 생성물만 읽는다.
+const FAQ_MANIFEST_KV_KEY = 'hondi-faq-manifest';
+const FAQ_MANIFEST_CACHE_TTL_SECONDS = 60 * 60; // 1시간 — site-manifest와 동일 주기
+const FAQ_FILE_CACHE_TTL_SECONDS = 60 * 60;
+const MAX_FAQ_INJECT = 2; // hondi-faq-router.js의 MAX_INJECT와 동일 상한
+
+async function fetchFaqManifestFromOrigin(env) {
+  const url = env.HONDI_FAQ_MANIFEST_URL || 'https://hondi.net/hondi-faq-manifest.json';
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`hondi-faq-manifest fetch failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+async function loadFaqManifest(env) {
+  const cached = await env.HONDI_SEARCH_HISTORY.get(FAQ_MANIFEST_KV_KEY, 'json');
+  if (cached) return cached;
+
+  let manifest;
+  try {
+    manifest = await fetchFaqManifestFromOrigin(env);
+  } catch (err) {
+    console.error('[hondi-search] hondi-faq-manifest 로드 실패, 정보질의 답변 기능 스킵:', err);
+    manifest = []; // 실패해도 검색 자체(navigate 등)는 계속 동작해야 하므로 빈 배열로 저하
+  }
+
+  await env.HONDI_SEARCH_HISTORY.put(FAQ_MANIFEST_KV_KEY, JSON.stringify(manifest), {
+    expirationTtl: FAQ_MANIFEST_CACHE_TTL_SECONDS,
+  });
+
+  return manifest;
+}
+
+// hondi-faq-router.js의 _matchFaqEntries/_hit 로직을 그대로 옮김(내용이
+// 아니라 알고리즘이므로 이 정도 중복은 두 워커 배포 경계상 불가피 — 실제
+// FAQ 문구/내용은 절대 복제하지 않고 항상 origin에서 fetch한다는 원칙은
+// 유지). 영숫자·하이픈만으로 된 트리거(PDV, GDC 등)는 단어 경계로,
+// 한글 구문 트리거는 부분 포함으로 매칭한다.
+const _ALNUM_ONLY = /^[a-z0-9-]+$/i;
+function _faqHit(text, kw) {
+  const kwLower = kw.toLowerCase();
+  if (_ALNUM_ONLY.test(kw)) {
+    return new RegExp(`(?:^|[^a-z0-9])${kwLower.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')}(?:[^a-z0-9]|$)`, 'i').test(text);
+  }
+  return text.includes(kwLower);
+}
+
+function matchFaqEntries(message, faqManifest) {
+  const q = (message || '').trim();
+  if (!q) return [];
+  const t = q.toLowerCase();
+  return (faqManifest || [])
+    .filter((entry) => (entry.triggers || []).some((kw) => _faqHit(t, kw)))
+    .slice(0, MAX_FAQ_INJECT);
+}
+
+const _faqFileCache = new Map(); // 워커 인스턴스 생존 기간 동안만 유지되는 메모리 캐시(요청 간 재사용은 KV가 담당)
+
+async function loadFaqFileContent(env, entry) {
+  const cacheKey = `faq-file:${entry.id}`;
+  if (_faqFileCache.has(cacheKey)) return _faqFileCache.get(cacheKey);
+
+  const kvCached = await env.HONDI_SEARCH_HISTORY.get(cacheKey);
+  if (kvCached != null) {
+    _faqFileCache.set(cacheKey, kvCached);
+    return kvCached;
+  }
+
+  const base = env.HONDI_FAQ_BASE_URL || 'https://hondi.net';
+  const url = `${base}${entry.base_path || '/prompts/HONDI-FAQ/'}${entry.file}`;
+  let text = '';
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`${res.status}`);
+    text = await res.text();
+  } catch (err) {
+    console.warn('[hondi-search] HONDI-FAQ 파일 로드 실패(무시):', entry.id, err.message);
+    return null;
+  }
+
+  await env.HONDI_SEARCH_HISTORY.put(cacheKey, text, { expirationTtl: FAQ_FILE_CACHE_TTL_SECONDS });
+  _faqFileCache.set(cacheKey, text);
+  return text;
+}
+
+async function buildFaqContext(env, message) {
+  const faqManifest = await loadFaqManifest(env);
+  const matched = matchFaqEntries(message, faqManifest);
+  if (!matched.length) return '';
+
+  const blocks = await Promise.all(matched.map((entry) => loadFaqFileContent(env, entry)));
+  const valid = blocks.filter(Boolean);
+  if (!valid.length) return '';
+
+  console.info('[hondi-search] HONDI-FAQ 참고자료 주입:', matched.map((e) => e.id).join(', '));
+  return valid.join('\n\n');
 }
 
 // 2026-09-09 신설 — 전문가 페르소나(552개) 로컬 매칭.
@@ -292,10 +412,11 @@ function buildUserContentWithAttachment(message, attachment) {
   return `${message}${note}`;
 }
 
-function buildMessages(sp, manifest, history, message, scope) {
+function buildMessages(sp, manifest, history, message, scope, faqContext) {
   const systemPrompt = sp
     .replace('{{SCOPE_NOTE}}', scope === 'dev' ? DEV_SCOPE_NOTE : '')
     .replace('{{SITE_MANIFEST_JSON}}', JSON.stringify(manifest))
+    .replace('{{FAQ_CONTEXT}}', faqContext || '(없음)')
     .replace('{{CONVERSATION_HISTORY}}', JSON.stringify(history));
 
   return [
@@ -382,7 +503,11 @@ export async function handleHondiSearch(request, env, corsHeaders, { _err }) {
   const scopedManifest = filterManifestByScope(manifest, scope);
 
   const userContent = buildUserContentWithAttachment(message, attachment);
-  const messages = buildMessages(HONDI_SEARCH_SP, scopedManifest, history, userContent, scope);
+  // 2026-09-14 신설 — 정보성 질문 매칭은 deepseek 호출 전에 로컬(키워드
+  // 매칭)로 먼저 수행한다. 매칭이 없으면 빈 문자열이 들어가 기존 동작과
+  // 완전히 동일하다(추가 LLM 호출 없음 — hondi-faq-router.js와 동일 원칙).
+  const faqContext = await buildFaqContext(env, message);
+  const messages = buildMessages(HONDI_SEARCH_SP, scopedManifest, history, userContent, scope, faqContext);
 
   let parsed;
   try {
